@@ -42,6 +42,12 @@ const tests = {
         assert.notEqual(refused.message, permanentClose(4415).message);
     },
 
+    "the mind's own pre-accept refusal is not retried either"() {
+        // 4401 is what a mind closes with when its server cannot send a
+        // denial response. Falling through would reattach forever.
+        assert.match(permanentClose(4401).message, /credential/);
+    },
+
     "a tile already open elsewhere stands down"() {
         assert.equal(permanentClose(1012).message, "open in another window");
     },

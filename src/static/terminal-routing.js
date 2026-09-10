@@ -86,6 +86,11 @@
      * @param {number} thresholdMs  silence tolerated before declaring death
      * @returns {boolean}
      */
+    function socketIsStale(nowMs, lastRecvAt, thresholdMs) {
+        if (!lastRecvAt) return false;   // nothing received yet — not our call
+        return (nowMs - lastRecvAt) > thresholdMs;
+    }
+
     /**
      * Whether a close code is a decision rather than a blip, and what to say.
      *
@@ -113,13 +118,13 @@
             // shape as 4415, different fix — the broker holds a token this
             // mind no longer accepts, or none at all.
             case 4416: return {message: "mind refused the gateway's credential"};
+            // The mind's own fallback when its server has no denial-response
+            // extension: it closes the unaccepted socket with this rather than
+            // sending a status. Nothing else produces it, and without a case
+            // here a tile that ever sees it reattaches forever.
+            case 4401: return {message: "mind refused the gateway's credential"};
             default: return null;
         }
-    }
-
-    function socketIsStale(nowMs, lastRecvAt, thresholdMs) {
-        if (!lastRecvAt) return false;   // nothing received yet — not our call
-        return (nowMs - lastRecvAt) > thresholdMs;
     }
 
     /**
