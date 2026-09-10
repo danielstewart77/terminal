@@ -86,6 +86,37 @@
      * @param {number} thresholdMs  silence tolerated before declaring death
      * @returns {boolean}
      */
+    /**
+     * Whether a close code is a decision rather than a blip, and what to say.
+     *
+     * The tile's fallback on an unrecognised code is to reattach with backoff,
+     * which is right for a dropped socket and wrong for every code in here:
+     * the mind has answered, its answer will not change by asking again, and a
+     * tile that keeps asking shows "reattaching..." forever over a refusal
+     * nobody can see. Each message names the remedy, because these are
+     * different problems with the same symptom — an image to rebuild, a
+     * credential the broker is holding stale, a tile already open elsewhere.
+     *
+     * @param {number} code  WebSocket close code
+     * @returns {{message: string}|null} null when the tile should retry
+     */
+    function permanentClose(code) {
+        switch (code) {
+            // Another tile took the keyboard. Reconnecting is a tug-of-war.
+            case 1012: return {message: "open in another window"};
+            // The mind took the attach and then refused it: no conversation to
+            // resume, or a harness with no pty.
+            case 1008: return {message: "mind refused the terminal"};
+            // Reachable, but its image predates the pty route.
+            case 4415: return {message: "no terminal on this mind"};
+            // Has the route, and rejected the gateway's credential. Same
+            // shape as 4415, different fix — the broker holds a token this
+            // mind no longer accepts, or none at all.
+            case 4416: return {message: "mind refused the gateway's credential"};
+            default: return null;
+        }
+    }
+
     function socketIsStale(nowMs, lastRecvAt, thresholdMs) {
         if (!lastRecvAt) return false;   // nothing received yet — not our call
         return (nowMs - lastRecvAt) > thresholdMs;
@@ -505,6 +536,7 @@
         isActive: isActive,
         retryDelayMs: retryDelayMs,
         socketIsStale: socketIsStale,
+        permanentClose: permanentClose,
         attemptsAfterSocket: attemptsAfterSocket,
         attachExhausted: attachExhausted,
         contrastText: contrastText,
