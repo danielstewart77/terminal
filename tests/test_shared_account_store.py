@@ -66,6 +66,41 @@ def test_an_account_made_where_the_console_makes_it_signs_in_here(
     # Straight to the password page, because the temporary one must change.
     assert response.headers["location"] == "/password"
     assert auth.SESSION_COOKIE_NAME in response.cookies
+    # And the account is in the file the console names, not in one only this
+    # site knows about: within one process the sign-in alone cannot tell one
+    # store from two, the console's own file can.
+    import os
+    import sqlite3
+
+    console_file = sqlite3.connect(os.environ["HIVE_DB_PATH"])
+    try:
+        rows = console_file.execute(
+            "SELECT username FROM users WHERE username = 'sloan'").fetchall()
+    finally:
+        console_file.close()
+    assert rows == [("sloan",)]
+
+
+def test_a_cookie_signed_by_one_site_verifies_on_the_other(
+        builtin_terminal, monkeypatch):
+    """The signing key is the store's, not the process's.
+
+    The terminal used to mint a key of its own into its own file, so each
+    site refused the other's cookie. Here the key is minted, the remembered
+    copy is dropped — which is what the other process looks like — and the
+    cookie must still verify, because the key is read back out of the store
+    rather than invented again.
+    """
+    monkeypatch.delenv("HIVE_SECRET_KEY", raising=False)
+    auth.forget_secret_key()
+    user = accounts.make_user("sloan", "sloans-own-pass")
+    token = accounts.session_token(user)
+
+    auth.forget_secret_key()
+    payload = accounts.run(auth.read_session_token(token))
+
+    assert payload is not None
+    assert payload["username"] == "sloan"
 
 
 def test_a_password_reset_where_the_console_does_it_ends_the_session_here(
@@ -90,43 +125,6 @@ def test_a_password_reset_where_the_console_does_it_ends_the_session_here(
 # ── the half the hive is moving to ──────────────────────────────────────
 
 
-def _scratch_postgres():
-    """A database of this site's own on the named server, and its DSN."""
-    import asyncpg
-
-    if not accounts.ADMIN_DSN:
-        pytest.skip(accounts.NO_SERVER)
-    name = f"terminal_site_{uuid.uuid4().hex[:12]}"
-
-    async def create() -> str:
-        admin = await asyncpg.connect(accounts.ADMIN_DSN)
-        try:
-            await admin.execute(f'CREATE DATABASE "{name}"')
-        finally:
-            await admin.close()
-        base, _, _ = accounts.ADMIN_DSN.rpartition("/")
-        dsn = f"{base}/{name}"
-        target = await asyncpg.connect(dsn)
-        try:
-            for schema in accounts.schemas():
-                await target.execute(schema)
-        finally:
-            await target.close()
-        return dsn
-
-    async def drop() -> None:
-        admin = await asyncpg.connect(accounts.ADMIN_DSN)
-        try:
-            await admin.execute(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                "WHERE datname = $1 AND pid <> pg_backend_pid()", name)
-            await admin.execute(f'DROP DATABASE IF EXISTS "{name}"')
-        finally:
-            await admin.close()
-
-    return asyncio.run(create()), drop
-
-
 @pytest.fixture
 def postgres_terminal(monkeypatch, fake_comms, tmp_path):
     """This site on a scratch Postgres, signed in through its own pages.
@@ -136,12 +134,15 @@ def postgres_terminal(monkeypatch, fake_comms, tmp_path):
     same loop. A pool opened anywhere else belongs to a loop the requests
     are not on, which is why the rest of this suite stays on the file.
     """
-    dsn, drop = _scratch_postgres()
+    if not accounts.ADMIN_DSN:
+        pytest.skip(accounts.NO_SERVER)
+    name, dsn = accounts.run(accounts.create_scratch_database("terminal_site"))
     monkeypatch.setenv("GATEWAY_API_URL", fake_comms.url)
     monkeypatch.setenv("HIVE_AUTH_BACKEND", "builtin")
     monkeypatch.setenv("HIVE_DATABASE_URL", dsn)
-    # Named, and pointing at a file that does not exist: if anything in this
-    # test reaches SQLite, it must fail rather than quietly answer.
+    # Named, so a stray SQLite open has somewhere to go — SQLite creates a
+    # missing file and answers, so this is not a guard by itself. The tests
+    # prove Postgres answered by reading the row back out of Postgres.
     monkeypatch.setenv("HIVE_DB_PATH", str(tmp_path / "must-not-be-used.db"))
     monkeypatch.setenv("HIVE_SECRET_KEY", "postgres-half-test-secret")
     monkeypatch.setenv("HIVE_SEED_USERNAME", "daniel")
@@ -150,7 +151,7 @@ def postgres_terminal(monkeypatch, fake_comms, tmp_path):
     try:
         yield dsn
     finally:
-        asyncio.run(drop())
+        accounts.run(accounts.drop_scratch_database(name))
 
 
 def test_the_terminal_signs_in_against_postgres(postgres_terminal):
@@ -171,35 +172,56 @@ def test_the_terminal_signs_in_against_postgres(postgres_terminal):
         assert signed_out.status_code == 303
         assert client.get("/terminal", follow_redirects=False).status_code == 303
 
-
-def test_a_version_bump_in_postgres_ends_the_terminals_session(
-        postgres_terminal):
-    """Requirement three, on Postgres.
-
-    The bump is written straight to the database, standing in for the
-    console making it from its own process — which is the case the file
-    version of this test cannot represent, because the two sites would be on
-    one file and this one would not be.
-    """
     import asyncpg
 
+    async def seeded() -> list:
+        conn = await asyncpg.connect(postgres_terminal)
+        try:
+            return await conn.fetch(
+                "SELECT username FROM core.users WHERE username = 'daniel'")
+        finally:
+            await conn.close()
+
+    assert [r["username"] for r in asyncio.run(seeded())] == ["daniel"]
+
+
+@pytest.mark.parametrize("action", ["reset", "disable", "change"])
+def test_what_the_console_does_to_an_account_on_postgres_ends_the_session_here(
+        postgres_terminal, action):
+    """Requirement three, on Postgres, through the console's own operations.
+
+    Each is the store operation the console's admin and password pages call,
+    run on the loop the app's lifespan opened the pool on — the portal —
+    because a pool belongs to the loop that opened it.
+    """
     with _client() as client:
         assert _sign_in(client, "daniel",
                         "daniels-own-password").status_code == 303
         assert client.get("/terminal",
                           follow_redirects=False).status_code == 200
+        held = client.cookies.get(auth.SESSION_COOKIE_NAME)
 
-        async def bump() -> None:
-            conn = await asyncpg.connect(postgres_terminal)
-            try:
-                await conn.execute(
-                    "UPDATE core.users SET session_version = "
-                    "session_version + 1 WHERE username = 'daniel'")
-            finally:
-                await conn.close()
+        account_store = auth.get_store()
+        if action == "reset":
+            client.portal.call(account_store.reset_password, "daniel",
+                               "a-reset-password")
+        elif action == "disable":
+            # The last enabled admin cannot be disabled, rightly, so there is
+            # a second one first.
+            client.portal.call(lambda: auth.create_user(
+                "deputy", "deputys-own-password", is_admin=True))
+            client.portal.call(
+                lambda: account_store.update_user("daniel", disabled=True))
+        else:
+            # The console's own password page, from another browser holding
+            # the same account: it mints that browser a fresh cookie and must
+            # end this one.
+            token = client.portal.call(
+                account_store.change_password, held,
+                "daniels-own-password", "daniels-newer-password")
+            assert token != held
 
-        asyncio.run(bump())
-
+        client.cookies.set(auth.SESSION_COOKIE_NAME, held)
         turned_away = client.get("/terminal", follow_redirects=False)
         assert turned_away.status_code == 303
         assert turned_away.headers["location"].startswith("/login")
@@ -224,10 +246,11 @@ def test_a_terminal_pointed_at_a_database_it_cannot_reach_refuses_to_start(
     fallback = tmp_path / "fallback" / "hive.db"
     monkeypatch.setenv("HIVE_DB_PATH", str(fallback))
 
-    with pytest.raises(Exception) as refused:
+    from hive_data.errors import Unreachable
+
+    with pytest.raises(Unreachable):
         asyncio.run(store.open())
 
-    assert not isinstance(refused.value, AssertionError)
     assert not fallback.exists(), "it created the file it was told not to use"
 
 
@@ -239,15 +262,48 @@ def test_unsetting_the_variable_returns_this_site_to_the_file(
     process's own environment, which is what lets the terminal be put back
     on the file while the console stays on Postgres.
     """
+    # The suite's fixture already has a store open on `tmp_path/hive.db`;
+    # close it and name a different file, so what is asserted is this open.
+    asyncio.run(store.close())
+    reverted = tmp_path / "reverted" / "hive.db"
     monkeypatch.setenv("HIVE_DATABASE_URL", "")
-    monkeypatch.setenv("HIVE_DB_PATH", str(tmp_path / "hive.db"))
+    monkeypatch.setenv("HIVE_DB_PATH", str(reverted))
 
     asyncio.run(store.open())
     try:
         assert not store.on_postgres()
-        assert store.sqlite_path() == tmp_path / "hive.db"
+        assert reverted.is_file()
         # And it is a working store, not merely a chosen one.
         made = accounts.make_user("sloan", "sloans-own-pass")
         assert accounts.run(store.get_user("sloan"))["id"] == made["id"]
     finally:
         asyncio.run(store.close())
+
+
+def test_a_cookie_from_another_store_never_signs_in_as_whoever_holds_its_id(
+        tmp_path, monkeypatch):
+    """Two stores, one signing key, independently numbered accounts.
+
+    Pointing the two sites apart is permitted, and their account ids then
+    drift. A cookie minted for one person on the first store must not
+    resolve to a different person on the second merely because the number
+    matches — on the second store that number can be an admin.
+    """
+    monkeypatch.setenv("HIVE_AUTH_BACKEND", "builtin")
+    monkeypatch.setenv("HIVE_SECRET_KEY", "one-key-two-stores")
+    asyncio.run(store.close())
+
+    monkeypatch.setenv("HIVE_DB_PATH", str(tmp_path / "console" / "hive.db"))
+    asyncio.run(store.open())
+    newcomer = accounts.make_user("newjoiner", "newjoiners-pass")
+    cookie = accounts.session_token(newcomer)
+    asyncio.run(store.close())
+
+    monkeypatch.setenv("HIVE_DB_PATH", str(tmp_path / "terminal" / "hive.db"))
+    asyncio.run(store.open())
+    holder = accounts.make_user("contractor", "contractors-pass", is_admin=True)
+    assert holder["id"] == newcomer["id"], "the ids have to collide to test this"
+
+    resolved = accounts.run(auth.get_store().user_for_token(cookie))
+
+    assert resolved is None

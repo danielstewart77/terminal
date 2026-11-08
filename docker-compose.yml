@@ -9,7 +9,7 @@ services:
         # each arrives as a build context rather than as a git install
         # needing a credential in the build.
         hive_site: ${HIVE_SITE_DIR:-/home/daniel/Storage/Dev/hive/hive_site}
-        hive_data: ${HIVE_DATA_DIR:?set HIVE_DATA_DIR in .env}
+        hive_data: ${HIVE_DATA_DIR:-/home/daniel/Storage/Dev/hive-data}
     container_name: terminal-site
     restart: unless-stopped
     ports:
@@ -31,9 +31,6 @@ services:
       - VOICE_API_URL=${VOICE_API_URL:-http://hive-mind-voice:8422}
     volumes:
       - ./src:/app/src
-      # The shared modules, live like ./src above. The console's compose
-      # mounts this same directory.
-      - ${HIVE_SITE_DIR:-/home/daniel/Storage/Dev/hive/hive_site}:/app/hive_site
       # Auth db — the hive site's, mounted directly (not a copy) so a
       # session issued by either site verifies on both.
       - ${HIVE_DB_HOST_DIR:-/home/daniel/Storage/Dev/hive/data}:/data

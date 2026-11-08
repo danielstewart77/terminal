@@ -66,9 +66,9 @@ Runs as container `terminal-site` on :8711, on the `hivemind` docker
 network (to reach `hive-comms` and the voice server). The hive site's
 `data/` directory is mounted directly, not copied, so both containers
 read and write the same `hive.db` when neither is on Postgres. `src/` is
-bind-mounted, and so is the hive repository's `hive_site/`, so an edit to
-the shared account store deploys live here and on the console; route
-changes need a container restart.
+bind-mounted; the shared `hive_site` package is installed into the image,
+so a change to it reaches this site by a rebuild; route changes need a
+container restart.
 
 `.env` keys: `COMMS_BEARER_TOKEN`; `HIVE_DATA_DIR` and, if the hive checkout
 is not at the default path, `HIVE_SITE_DIR` — the two build contexts;
